@@ -1,0 +1,17 @@
+[project]
+name = "agi"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Samuel Silva",email = "samuelcastrosilva@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "agisdk (>=0.1.17,<0.2.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
