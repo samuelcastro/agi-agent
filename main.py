@@ -340,14 +340,27 @@ class DemoAgent(Agent):
 
         # append past actions (and last error message) if any
         if self.action_history:
-            history_text = "\n".join(self.action_history)
-            prompt_section = f"""# History of past actions
+            # Add header for history section
+            user_msgs.append(
+                {
+                    "type": "text",
+                    "text": "# History of past actions\n",
+                }
+            )
+            # Add each past action as a separate message
+            user_msgs.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"{action}", # Each action on its own line/message
+                    }
+                    for action in self.action_history
+                ]
+            )
 
-{history_text}
-"""
-
+            # Add error critique or history reflection message
             if obs["last_action_error"]:
-                prompt_section += f"""\n# Error message from last action
+                critique_prompt = f"""# Error message from last action
 
 {obs["last_action_error"]}
 
@@ -355,21 +368,16 @@ class DemoAgent(Agent):
 
 Analyze the error message above. Explain why the last action failed and how your next action will address this error to achieve the goal.
 """
+                user_msgs.append({"type": "text", "text": critique_prompt})
             else:
                 # Add a reflection prompt if there was no error
-                prompt_section += f"""\n# Reflection on History
+                reflection_prompt = f"""# Reflection on History
 
 Briefly explain how the history of actions informs your next step towards the goal.
 """
+                user_msgs.append({"type": "text", "text": reflection_prompt})
 
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": prompt_section,
-                }
-            )
-
-        # Add reflection step
+        # Add reflection step (This is the separate overall reflection)
         user_msgs.append(
             {
                 "type": "text",
