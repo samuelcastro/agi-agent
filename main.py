@@ -340,38 +340,47 @@ class DemoAgent(Agent):
 
         # append past actions (and last error message) if any
         if self.action_history:
+            history_text = "\n".join(self.action_history)
+            prompt_section = f"""# History of past actions
+
+{history_text}
+"""
+
+            if obs["last_action_error"]:
+                prompt_section += f"""\n# Error message from last action
+
+{obs["last_action_error"]}
+
+# Self-Critique and Correction
+
+Analyze the error message above. Explain why the last action failed and how your next action will address this error to achieve the goal.
+"""
+            else:
+                # Add a reflection prompt if there was no error
+                prompt_section += f"""\n# Reflection on History
+
+Briefly explain how the history of actions informs your next step towards the goal.
+"""
+
             user_msgs.append(
                 {
                     "type": "text",
-                    "text": f"""\
-                            # History of past actions
-                            """,
+                    "text": prompt_section,
                 }
             )
-            user_msgs.extend(
-                [
-                    {
-                        "type": "text",
-                        "text": f"""\
-                                {action}
-                                """,
-                    }
-                    for action in self.action_history
-                ]
-            )
 
-            if obs["last_action_error"]:
-                user_msgs.append(
-                    {
-                        "type": "text",
-                        "text": f"""\
-                            # Error message from last action
+        # Add reflection step
+        user_msgs.append(
+            {
+                "type": "text",
+                "text": f"""\n# Reflection
 
-                            {obs["last_action_error"]}
-
-                            """,
-                    }
-                )
+Review your progress towards the goal: '{obs["goal_object"]}'. 
+Assess the effectiveness of your previous actions based on the history and current page state. 
+Briefly state your current high-level plan or if you need to adjust it.
+"""
+            }
+        )
 
         # ask for the next action
         user_msgs.append(
