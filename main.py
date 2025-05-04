@@ -43,7 +43,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# NEW IMPORTS for LangGraph and Pydantic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from pydantic.v1 import BaseModel, Field # <-- Use pydantic.v1 compatibility
@@ -51,7 +50,7 @@ from langchain_core.output_parsers.openai_tools import PydanticToolsParser
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
-from typing import Annotated
+from typing import Annotated, Optional
 from langchain_openai import ChatOpenAI # Ensure OpenAI is imported correctly
 
 # Define Pydantic models for structured LLM output
@@ -64,10 +63,28 @@ class ActionDecision(BaseModel):
     action: str = Field(description="The action string to execute in the environment (e.g., 'click(\"12\")').")
     reflection: Reflection = Field(description="Your reflection on the reasoning and chosen action.")
 
+# --- New Models for Multi-Step Reflexion --- 
+class ProposedAction(BaseModel):
+    """A proposed action with reasoning."""
+    action: str = Field(description="The proposed action string (e.g., 'click(\"12\")').")
+    reasoning: str = Field(description="Step-by-step reasoning for proposing this action.")
+
+class Critique(BaseModel):
+    """A critique of the proposed action."""
+    critique: str = Field(description="Constructive critique of the proposed action's reasoning and applicability.")
+    is_sufficient: bool = Field(description="Whether the proposed action is sufficient and correct to proceed (True/False).")
+    missing: str = Field(description="Critique of what is missing.")
+    superfluous: str = Field(description="Critique of what is superfluous.")
+# --- End New Models --- 
+
 
 # Define LangGraph state
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
+    # Add state for the multi-step reflexion process
+    proposed_action: Optional[ProposedAction] = None
+    critique: Optional[Critique] = None
+    revision_attempts: int = 0 # To limit loops
     # We might add more state elements later if needed (e.g., original_input)
 
 
@@ -160,16 +177,29 @@ class DemoAgent(Agent):
         # --- LangGraph Setup ---
         builder = StateGraph(AgentState)
 
-        # Define the Actor Node (generates action + reflection)
-        builder.add_node("actor", self._actor_node)
+        # Define the Nodes for the Reflexion loop
+        builder.add_node("propose_action", self._propose_action_node)
+        builder.add_node("critique_action", self._critique_action_node)
+        builder.add_node("revise_action", self._revise_action_node)
 
-        # Define edges (simple: start -> actor -> end)
-        builder.add_edge(START, "actor")
-        builder.add_edge("actor", END)
+        # Define edges 
+        builder.add_edge(START, "propose_action")
+        builder.add_edge("propose_action", "critique_action")
+        builder.add_conditional_edges(
+            "critique_action",
+            self._should_revise, # Function to decide route
+            {
+                "revise": "revise_action", # If critique says revise, go to revise node
+                END: END  # If critique says sufficient, end the graph
+            }
+        )
+        # After revision, critique again (simple loop for now)
+        # In a more complex setup, revise_action could also lead to END
+        builder.add_edge("revise_action", "critique_action") 
 
         # Compile the graph
         self.graph = builder.compile()
-        # print(self.graph.get_graph().print_ascii())
+        # print(self.graph.get_graph().print_ascii()) # Optional: print graph structure
         # --- End LangGraph Setup ---
 
         # Initialize Agent base class AFTER graph is ready
@@ -221,224 +251,408 @@ class DemoAgent(Agent):
         # Remove the old query_model function
         # self.query_model = query_model # Removed
 
-    def _construct_prompt_messages(self, processed_obs: dict) -> List[BaseMessage]:
-        """Helper to construct the list of messages for the LLM."""
+    def _construct_prompt_messages(self, processed_obs: dict, current_step: Literal["propose", "critique", "revise"]) -> List[BaseMessage]:
+        """Helper to construct the list of messages for the LLM, tailored to the current step."""
         messages = []
 
-        # 1. System Prompt (incorporating Reflexion instructions)
-        system_prompt_text = f"""\
+        # --- Base Information (System Prompt, Goal/Chat, Observations, History) ---
+        # 1. System Prompt (Base instructions, Action Space)
+        system_prompt_base = f"""\
 # Instructions
 
 You are a UI Assistant operating a web browser to help a user or achieve a goal.
-Review the current state of the page, the user's request/goal, your past actions, and crucially, your *past reflections* on those actions.
-Think step-by-step to determine the best next action.
-Critique your own reasoning process: identify missing considerations and potential flaws or superfluous steps in your plan *before* making a final decision.
-Output your final action and your reflection using the required {ActionDecision.__name__} tool format.
+Review the current state of the page, the user's request/goal, and your action/reflection history.
+Your goal is to decide the single best next action to take through proposal and critique.
 
 # Action Space
 
 {self.action_set.describe(with_long_description=False, with_examples=True)}
-
-# Reflection Guide
-
-When reflecting, consider:
-- Is the planned action directly helping achieve the goal?
-- Are there simpler or more direct actions available?
-- Did I miss any important elements on the page?
-- Is the action based on correct understanding of the page state?
-- Does this action address points raised in previous reflections?
 """
-        messages.append(SystemMessage(content=system_prompt_text))
-
+        messages.append(SystemMessage(content=system_prompt_base))
+        
         # 2. Goal / Chat History
         if self.chat_mode:
             messages.append(HumanMessage(content="# Chat History\n(Review messages to understand user intent)"))
             for msg in processed_obs["chat_messages"]:
-                 role_prefix = f"[{msg['role'].upper()}]"
-                 if msg["role"] == "user_image":
-                     # LangChain messages handle images differently, we might need adjustment
-                     # For now, represent as text placeholder
-                     messages.append(HumanMessage(content=f"{role_prefix} (User sent an image)"))
-                 elif msg["role"] in ("user", "assistant", "infeasible"):
-                     messages.append(HumanMessage(content=f"{role_prefix} {msg['message']}"))
-                 else:
-                     logger.warning(f"Unexpected chat message role {repr(msg['role'])}")
-                     messages.append(HumanMessage(content=f"[{msg['role'].upper()}] {msg['message']}"))
-
+                role_prefix = f"[{msg['role'].upper()}]"
+                if msg["role"] == "user_image":
+                    messages.append(HumanMessage(content=f"{role_prefix} (User sent an image)"))
+                elif msg["role"] in ("user", "assistant", "infeasible"):
+                    messages.append(HumanMessage(content=f"{role_prefix} {msg['message']}"))
+                else:
+                    logger.warning(f"Unexpected chat message role {repr(msg['role'])}")
+                    messages.append(HumanMessage(content=f"[{msg['role'].upper()}] {msg['message']}"))
         else: # Goal-oriented mode
             goal_text = processed_obs.get("goal_object", "No goal specified.")
-            messages.append(HumanMessage(content=f"# Goal\n\n{goal_text}"))
-            # Assuming goal_object is text or directly usable as message content
-            if isinstance(goal_text, list): # Handle if goal_object is list of messages
-                 messages.extend(goal_text)
+            messages.append(HumanMessage(content=f"# Goal\n\n{str(goal_text)}"))
+            if isinstance(processed_obs.get("goal_object"), list):
+                for item in processed_obs["goal_object"]:
+                    if isinstance(item, dict) and 'type' in item and item['type'] == 'text' and 'text' in item:
+                        messages.append(HumanMessage(content=item['text']))
+                    elif isinstance(item, BaseMessage):
+                        messages.append(item)
 
-
-        # 3. Observation Details (AXTree, HTML, Screenshot)
+        # 3. Observation Details
         obs_content = []
         if self.use_axtree and processed_obs.get("axtree_txt"):
             obs_content.append(f"# Current page Accessibility Tree\n\n{processed_obs['axtree_txt']}")
         if self.use_html and processed_obs.get("pruned_html"):
-             obs_content.append(f"# Current page DOM (pruned)\n\n{processed_obs['pruned_html']}")
-        
-        # Handle Screenshot - LangChain expects image URLs or base64 in message content
+            obs_content.append(f"# Current page DOM (pruned)\n\n{processed_obs['pruned_html']}")
         if self.use_screenshot and processed_obs.get("screenshot") is not None:
-             try:
-                 img_url = image_to_jpg_base64_url(processed_obs["screenshot"])
-                 # Add text marker and the image message
-                 obs_content.append("# Current page Screenshot")
-                 messages.append(HumanMessage(content=[{"type": "text", "text": "\n".join(obs_content)}, {"type": "image_url", "image_url": {"url": img_url}}]))
-                 obs_content = [] # Clear obs_content as it's now part of the image message
-             except Exception as e:
-                 logger.error(f"Failed to process screenshot for prompt: {e}")
-                 obs_content.append("# Current page Screenshot (Error processing image)")
-        
-        # Add any remaining text observations
+            try:
+                img_url = image_to_jpg_base64_url(processed_obs["screenshot"])
+                obs_content.append("# Current page Screenshot")
+                messages.append(HumanMessage(content=[{"type": "text", "text": "\n".join(obs_content)}, {"type": "image_url", "image_url": {"url": img_url}}]))
+                obs_content = [] 
+            except Exception as e:
+                logger.error(f"Failed to process screenshot for prompt: {e}")
+                obs_content.append("# Current page Screenshot (Error processing image)")
         if obs_content:
             messages.append(HumanMessage(content="\n\n".join(obs_content)))
 
-
-        # 4. Action & Reflection History
+        # 4. Action & *Critique* History
         if self.action_history:
-            history_content = ["# History (Past Actions and Reflections)"]
+            history_content = ["# History (Past Actions and Critiques)"]
             for i, action in enumerate(self.action_history):
-                reflection_text = "No reflection recorded."
+                critique_text = "No critique recorded."
                 if i < len(self.reflection_history) and self.reflection_history[i]:
-                     reflection = self.reflection_history[i]
-                     reflection_text = f"  Reflection: Missing: '{reflection.missing}', Superfluous: '{reflection.superfluous}'"
-                history_content.append(f"- Action: {action}\n{reflection_text}")
-            
+                    critique: Critique = self.reflection_history[i]
+                    critique_text = f"  Critique: '{critique.critique}' (Sufficient: {critique.is_sufficient}, Missing: '{critique.missing}', Superfluous: '{critique.superfluous}')"
+                history_content.append(f"- Action: {action}\n{critique_text}")
             if processed_obs.get("last_action_error"):
                 history_content.append(f"\n# Error message from last action\n\n{processed_obs['last_action_error']}")
-            
             messages.append(HumanMessage(content='\n'.join(history_content)))
-
-        # 5. Final Instruction to Act
-        messages.append(HumanMessage(content="# Next Action and Reflection\n\nReview all the information above. Think step-by-step, reflect on your reasoning, and then provide your chosen action and reflection using the required tool format."))
+        
+        # --- Step-Specific Instructions --- 
+        if current_step == "propose":
+            messages.append(HumanMessage(content=f"# Task: Propose Action\n\nBased on the goal, observations, and history, propose the best single next action and your reasoning for it. Use the {ProposedAction.__name__} tool."))
+        elif current_step == "critique":
+            # Assume proposed_action is available in the state when constructing prompt for critique
+             messages.append(HumanMessage(content=f"# Task: Critique Proposed Action\n\Critically evaluate the proposed action and reasoning provided in the previous step. Is it the best possible action? Is it safe? Does it directly address the goal and consider the history/errors? Provide detailed feedback. Use the {Critique.__name__} tool."))
+        elif current_step == "revise":
+             messages.append(HumanMessage(content=f"# Task: Revise Action\n\Based on the critique provided, revise your proposed action. Address the points raised in the critique. Use the {ProposedAction.__name__} tool to output the revised action and reasoning."))
         
         return messages
 
-    def _actor_node(self, state: AgentState) -> dict:
-        """Node that invokes the LLM to generate action and reflection."""
-        logger.info("Invoking actor node...")
-        # Assumes the state['messages'] has been prepared correctly before calling the graph
+    # --- LangGraph Node Functions --- 
+
+    def _propose_action_node(self, state: AgentState) -> dict:
+        """Node that invokes the LLM to propose an action and reasoning."""
+        logger.info("Invoking propose_action node...")
+        # Construct prompt specifically for proposal
+        # Need access to observation data - how is it passed? Assume it's part of initial state['messages'] or accessible via self?
+        # For now, assume initial messages are correctly in state["messages"]
+        # We need to reconstruct the prompt messages here using the state
+        # This requires passing the original observation into the graph state or accessing it via self.
+        # Let's assume we modify get_action to put obs in state later.
+        # For now, we work with the messages already in state.
+
+        # Bind the ProposedAction tool
+        propose_llm = self.llm.bind_tools(tools=[ProposedAction], tool_choice=ProposedAction.__name__)
         
-        # Handle dummy key simulation if needed
-        openai_api_key = os.getenv("OPENAI_API_KEY", "sk-dummy-key-for-testing")
-        if openai_api_key.startswith("sk-dummy"):
-             logger.warning("Using dummy API key - simulating LLM response.")
-             # Simulate a response conforming to the ActionDecision tool
-             simulated_response = AIMessage(
-                 content="", 
-                 tool_calls=[{
-                     "id": "tool_dummy_123",
-                     "name": ActionDecision.__name__,
-                     "args": {
-                         "action": "click(\"1\")",
-                         "reflection": {"missing": "None", "superfluous": "None"}
-                     }
-                 }]
-             )
-             return {"messages": [simulated_response]}
+        try:
+            # Add the step-specific instruction
+            current_messages = state['messages'] + [HumanMessage(content=f"# Task: Propose Action\n\nBased on the goal, observations, and history, propose the best single next action and your reasoning for it. Use the {ProposedAction.__name__} tool.")]
+            response = propose_llm.invoke(current_messages)
+
+            if not response.tool_calls or response.tool_calls[0]['name'] != ProposedAction.__name__:
+                logger.error(f"LLM did not return the expected {ProposedAction.__name__} tool call.")
+                # Handle error - maybe raise or return a default error state?
+                # For now, create a dummy response to avoid breaking graph flow
+                fallback_proposal = ProposedAction(action="report_infeasible('Proposal node failed')", reasoning="LLM failed format.")
+                response = AIMessage(content="", tool_calls=[{"id": "tool_fallback_propose", "name": ProposedAction.__name__, "args": fallback_proposal.dict()}])
+            
+            # Parse and store the proposed action in the state
+            parsed_proposal: ProposedAction = PydanticToolsParser(tools=[ProposedAction]).invoke(response)[0]
+            logger.info(f"Proposed Action: {parsed_proposal.action}, Reasoning: {parsed_proposal.reasoning[:50]}...")
+            # Update state: add AI response and the parsed proposal object
+            return {"messages": [response], "proposed_action": parsed_proposal, "revision_attempts": 0} 
+        except Exception as e:
+            logger.error(f"Error in propose_action_node: {e}")
+            # Handle error state
+            fallback_proposal = ProposedAction(action="report_infeasible('Error in proposal node')", reasoning=f"Exception: {e}")
+            response = AIMessage(content="", tool_calls=[{"id": "tool_error_propose", "name": ProposedAction.__name__, "args": fallback_proposal.dict()}])
+            return {"messages": [response], "proposed_action": fallback_proposal}
+
+    def _critique_action_node(self, state: AgentState) -> dict:
+        """Node that invokes the LLM to critique the proposed action."""
+        logger.info("Invoking critique_action node...")
+        proposed_action = state.get("proposed_action")
+        if not proposed_action:
+             logger.error("Critique node called without a proposed action in state.")
+             # Handle error - maybe skip critique or return error state?
+             fallback_critique = Critique(critique="No action proposed for critique.", is_sufficient=False, missing="Proposal step failed.", superfluous="N/A")
+             return {"critique": fallback_critique} # Don't add messages if proposal was missing
+
+        # Bind the Critique tool
+        critique_llm = self.llm.bind_tools(tools=[Critique], tool_choice=Critique.__name__)
+        
+        try:
+            # Construct messages for critique: Use the base history, but EXCLUDE the last AI message 
+            # from the proposal step (which has the un-responded-to tool call). 
+            # Add the proposal details as a separate HumanMessage.
+            base_messages = state['messages']
+            # Filter out the last message if it's an AIMessage with the proposal tool call
+            if (
+                base_messages and 
+                isinstance(base_messages[-1], AIMessage) and 
+                base_messages[-1].tool_calls and 
+                base_messages[-1].tool_calls[0]['name'] == ProposedAction.__name__
+            ):
+                 critique_prompt_messages = base_messages[:-1] # Exclude the last message
+            else:
+                 critique_prompt_messages = base_messages # Use as is if last message wasn't the proposal AI msg
+            
+            critique_prompt_messages = critique_prompt_messages + [
+                 HumanMessage(content=f"# Proposed Action for Critique\nAction: `{proposed_action.action}`\nReasoning: {proposed_action.reasoning}"),
+                 HumanMessage(content=f"# Task: Critique Proposed Action\n\Critically evaluate the proposed action and reasoning. Is it the best possible action? Is it safe? Does it directly address the goal and consider the history/errors? Provide detailed feedback. Use the {Critique.__name__} tool.")
+             ]
+            response = critique_llm.invoke(critique_prompt_messages)
+
+            if not response.tool_calls or response.tool_calls[0]['name'] != Critique.__name__:
+                 logger.error(f"LLM did not return the expected {Critique.__name__} tool call.")
+                 # Handle error
+                 fallback_critique = Critique(critique="LLM failed to provide critique.", is_sufficient=True, missing="Critique format error.", superfluous="N/A") # Default to sufficient to avoid infinite loop on format error
+                 response = AIMessage(content="", tool_calls=[{"id": "tool_fallback_critique", "name": Critique.__name__, "args": fallback_critique.dict()}])
+
+            # Parse and store the critique
+            parsed_critique: Critique = PydanticToolsParser(tools=[Critique]).invoke(response)[0]
+            logger.info(f"Critique: {parsed_critique.critique[:50]}... | Sufficient: {parsed_critique.is_sufficient}")
+            # Update state: add AI response and the parsed critique object
+            return {"messages": [response], "critique": parsed_critique}
+        except Exception as e:
+             logger.error(f"Error in critique_action_node: {e}")
+             # Handle error state
+             fallback_critique = Critique(critique=f"Exception during critique: {e}", is_sufficient=True, missing="Critique step failed.", superfluous="N/A")
+             response = AIMessage(content="", tool_calls=[{"id": "tool_error_critique", "name": Critique.__name__, "args": fallback_critique.dict()}])
+             return {"messages": [response], "critique": fallback_critique}
+
+    def _revise_action_node(self, state: AgentState) -> dict:
+        """Node that invokes the LLM to revise the proposed action based on critique."""
+        logger.info("Invoking revise_action node...")
+        proposed_action = state.get("proposed_action")
+        critique = state.get("critique")
+        if not proposed_action or not critique:
+            logger.error("Revise node called without proposed action or critique.")
+            return {}
+
+        # Bind the ProposedAction tool (for the *revised* action)
+        revise_llm = self.llm.bind_tools(tools=[ProposedAction], tool_choice=ProposedAction.__name__)
 
         try:
-            # Invoke the LLM with the prepared messages and bound tool
-            response = self.llm_with_tool.invoke(state["messages"])
-            # We expect the response to be an AIMessage with a tool_call
-            if not response.tool_calls or response.tool_calls[0]['name'] != ActionDecision.__name__:
-                 # Fallback or error handling if the LLM didn't use the tool
-                 logger.error(f"LLM did not return the expected {ActionDecision.__name__} tool call. Response: {response}")
-                 # Attempt to coerce or return an error action
-                 fallback_action = "send_msg_to_user(\"Internal error: Failed to decide action.\")"
-                 fallback_reflection = Reflection(missing="LLM failed to use the required format.", superfluous="None")
-                 response = AIMessage(content="", tool_calls=[{"id": "tool_fallback_123", "name": ActionDecision.__name__, "args": {"action": fallback_action, "reflection": fallback_reflection.dict()}}])
-            
-            return {"messages": [response]} # Append the LLM's response (with tool call)
-        except Exception as e:
-            logger.error(f"Error calling LLM in actor node: {e}")
-            # Return a safe fallback action
-            error_action = "send_msg_to_user(\"I encountered an error processing my decision.\")"
-            error_reflection = Reflection(missing="Error occurred during LLM call.", superfluous="None")
-            error_response = AIMessage(content="", tool_calls=[{"id": "tool_error_123", "name": ActionDecision.__name__, "args": {"action": error_action, "reflection": error_reflection.dict()}}])
-            return {"messages": [error_response]}
+            # Construct messages for revision: Use base history, exclude intermediate AI calls, add proposal + critique
+            base_messages = state['messages']
+            # Filter out AI messages with tool calls that haven't been responded to
+            revision_base_messages = []
+            for i, msg in enumerate(base_messages):
+                # Add message if it's not an AI message with tool calls OR 
+                # if it IS an AI message with tool calls but the *next* message is a ToolMessage
+                if not (isinstance(msg, AIMessage) and msg.tool_calls):
+                     revision_base_messages.append(msg)
+                elif i + 1 < len(base_messages) and isinstance(base_messages[i+1], ToolMessage):
+                     revision_base_messages.append(msg) # Include if it has a corresponding ToolMessage (though we aren't adding ToolMessages yet)
+                 # Otherwise, skip the AI message with unfulfilled tool calls
 
+            revision_prompt_messages = revision_base_messages + [
+                 HumanMessage(content=f"# Previous Proposed Action\nAction: `{proposed_action.action}`\nReasoning: {proposed_action.reasoning}"),
+                 HumanMessage(content=f"# Critique Received\nCritique: {critique.critique}\nMissing: {critique.missing}\nSuperfluous: {critique.superfluous}"),
+                 HumanMessage(content=f"# Task: Revise Action\n\nBased *specifically* on the critique provided, revise your proposed action and reasoning. Address the points raised. Use the {ProposedAction.__name__} tool.")
+            ]
+            response = revise_llm.invoke(revision_prompt_messages)
+
+            if not response.tool_calls or response.tool_calls[0]['name'] != ProposedAction.__name__:
+                 logger.error(f"LLM did not return the expected {ProposedAction.__name__} tool call during revision.")
+                 # Handle error - return original proposal?
+                 return {"messages": [response]} # Keep proposed_action as is in state?
+            
+            # Parse and store the *revised* proposed action
+            parsed_revised_proposal: ProposedAction = PydanticToolsParser(tools=[ProposedAction]).invoke(response)[0]
+            logger.info(f"Revised Action: {parsed_revised_proposal.action}, Reasoning: {parsed_revised_proposal.reasoning[:50]}...")
+            # Update state: add AI response, update proposed_action, increment revision attempts
+            return {
+                "messages": [response], 
+                "proposed_action": parsed_revised_proposal, 
+                "revision_attempts": state.get("revision_attempts", 0) + 1
+            }
+        except Exception as e:
+            logger.error(f"Error in revise_action_node: {e}")
+            # Handle error state - potentially just keep the original proposal
+            return {}
+
+    # --- Conditional Edge Logic --- 
+
+    def _should_revise(self, state: AgentState) -> Literal["revise", END]:
+        """Determine whether to revise the action based on the critique."""
+        logger.info("Checking critique to decide whether to revise...")
+        critique = state.get("critique")
+        revision_attempts = state.get("revision_attempts", 0)
+        max_revisions = 1 # Set a limit for revisions
+
+        if critique and not critique.is_sufficient and revision_attempts < max_revisions:
+            logger.info(f"Critique not sufficient (Attempt {revision_attempts + 1}). Revising.")
+            return "revise"
+        else:
+            if critique and critique.is_sufficient:
+                 logger.info("Critique sufficient. Proceeding.")
+            elif revision_attempts >= max_revisions:
+                 logger.warning(f"Max revision attempts ({max_revisions}) reached. Proceeding with last proposal.")
+            else:
+                 logger.warning("No critique found, proceeding with proposed action.")
+            return END
 
     def get_action(self, obs: dict) -> tuple[str, dict]:
-        # 1. Preprocess observation (already done by harness)
-        # processed_obs = self.obs_preprocessor(obs) # obs is already processed by harness
-        processed_obs = obs # Use the observation directly passed by the harness
+        # 1. Preprocess observation (if needed, but harness usually does it)
+        processed_obs = obs
 
-        # 2. Construct prompt messages
-        prompt_messages = self._construct_prompt_messages(processed_obs)
+        # 2. Construct INITIAL prompt messages (for proposal step)
+        # NOTE: We are now creating the *initial* prompt here.
+        # The nodes themselves will add their specific task instructions later.
+        # This prompt needs access to the observation details.
+        initial_messages = self._construct_base_messages_for_graph(processed_obs)
 
-        # Log the prompt text (optional, can be verbose)
-        # full_prompt_txt = "\n".join([str(m.content) for m in prompt_messages if isinstance(m.content, str)])
-        # logger.info(f"--- Sending Prompt to LLM ---\n{full_prompt_txt[:1000]}...\n--- End Prompt ---")
-
-        # 3. Invoke the LangGraph graph
-        graph_input = {"messages": prompt_messages}
+        # 3. Invoke the LangGraph graph with initial state
+        graph_input = {
+             "messages": initial_messages,
+             "revision_attempts": 0 # Initialize revision counter
+             # Pass other necessary initial state if AgentState definition changes
+        }
+        logger.info("Invoking Reflexion graph...")
         final_state = self.graph.invoke(graph_input)
+        logger.info("Reflexion graph finished.")
 
-        # 4. Parse the result from the final state
-        last_message = final_state["messages"][-1]
-        action_str = "send_msg_to_user(\"Error: Could not determine action.\")" # Default fallback
-        current_reflection = Reflection(missing="Result parsing failed.", superfluous="") # Default fallback
+        # 4. Parse the FINAL action and critique from the final state
+        final_action = final_state.get("proposed_action")
+        final_critique = final_state.get("critique")
 
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            tool_call = last_message.tool_calls[0]
-            if tool_call['name'] == ActionDecision.__name__:
-                try:
-                    parsed_result: ActionDecision = self.parser.invoke(last_message)[0] # Parse Pydantic model
-                    action_str = parsed_result.action
-                    current_reflection = parsed_result.reflection
-                    logger.info(f"Action chosen: {action_str}")
-                    logger.info(f"Reflection: Missing='{current_reflection.missing}', Superfluous='{current_reflection.superfluous}'")
-                except Exception as e:
-                    logger.error(f"Failed to parse ActionDecision from LLM response: {e}. Tool call args: {tool_call.get('args')}")
-            else:
-                 logger.error(f"Unexpected tool call in final message: {tool_call['name']}")
+        action_str = "report_infeasible(\"Error: Could not determine final action after reflexion.\")" # Default fallback
+        stored_critique = Critique(critique="Graph execution failed to produce final critique.", is_sufficient=False, missing="N/A", superfluous="N/A")
+
+        if final_action:
+            action_str = final_action.action
+            logger.info(f"Final Action Chosen: {action_str}")
         else:
-             logger.error(f"Unexpected final message type or content: {last_message}")
+            logger.error("Final state did not contain a proposed_action.")
+        
+        if final_critique:
+            stored_critique = final_critique
+            logger.info(f"Final Critique: {stored_critique.critique[:50]}... | Sufficient: {stored_critique.is_sufficient}")
+        else:
+            # This might happen if the graph ends before critique if propose fails badly
+            logger.warning("Final state did not contain a critique.")
 
-
-        # 5. Store action and reflection history (before returning action)
+        # 5. Store action and *final critique* history
         self.action_history.append(action_str)
-        self.reflection_history.append(current_reflection)
+        # Store the Critique object itself
+        self.reflection_history.append(stored_critique) 
 
         # 6. Log step via AgentLogger (if enabled)
         if hasattr(self, 'agent_logger') and self.agent_logger is not None:
-            try:
-                 # (Keep the existing logging logic, adapting inputs/outputs as needed)
-                 inputs = {
-                     "prompt_summary": "Prompt constructed with history and reflection.", # Simplify logging
-                     "observation": { # Keep observation summary
-                         "num_chat_messages": len(processed_obs.get("chat_messages", [])),
-                         "has_screenshot": "screenshot" in processed_obs and processed_obs["screenshot"] is not None,
-                         "has_axtree": "axtree_txt" in processed_obs and processed_obs["axtree_txt"] is not None,
-                         "has_html": "pruned_html" in processed_obs and processed_obs["pruned_html"] is not None,
-                         "goal": str(processed_obs.get("goal_object", ""))[:100] + "..." if processed_obs.get("goal_object") and len(str(processed_obs["goal_object"])) > 100 else str(processed_obs.get("goal_object", "")),
-                         "last_action": processed_obs.get("last_action", ""),
-                         "last_action_error": processed_obs.get("last_action_error", ""),
-                     }
+             try:
+                 inputs = { # ... (same as before) ...
+                    "prompt_summary": "Prompt constructed with history and reflection.", 
+                    "observation": { 
+                        "num_chat_messages": len(processed_obs.get("chat_messages", [])),
+                        "has_screenshot": "screenshot" in processed_obs and processed_obs["screenshot"] is not None,
+                        "has_axtree": "axtree_txt" in processed_obs and processed_obs["axtree_txt"] is not None,
+                        "has_html": "pruned_html" in processed_obs and processed_obs["pruned_html"] is not None,
+                        "goal": str(processed_obs.get("goal_object", ""))[:100] + "..." if processed_obs.get("goal_object") and len(str(processed_obs["goal_object"])) > 100 else str(processed_obs.get("goal_object", "")),
+                        "last_action": processed_obs.get("last_action", ""),
+                        "last_action_error": processed_obs.get("last_action_error", ""),
+                    }
                  }
                  outputs = {
                      "action": action_str,
                      "action_type": action_str.split("(")[0] if "(" in action_str else "unknown",
-                     "reflection_missing": current_reflection.missing,
-                     "reflection_superfluous": current_reflection.superfluous,
+                     "critique_missing": stored_critique.missing,
+                     "critique_superfluous": stored_critique.superfluous,
+                     "critique_sufficient": stored_critique.is_sufficient,
+                     "critique_text": stored_critique.critique,
                  }
                  # self.agent_logger.log_step(inputs, outputs) # Uncomment if AgentLogger is available
 
                  action_type = action_str.split("(")[0] if "(" in action_str else "unknown"
                  action_args = action_str.split("(", 1)[1].rstrip(")") if "(" in action_str else ""
-                 # step_count = self.agent_logger.step_count if self.agent_logger else len(self.action_history) # Get step count
-                 step_count = len(self.action_history) # Use action history length as step count
-                 print(f"Step {step_count}: {action_type} {action_args[:30]}{'...' if len(action_args) > 30 else ''} | Reflection: {current_reflection.missing[:30]}...")
+                 step_count = len(self.action_history)
+                 print(f"Step {step_count}: {action_type} {action_args[:30]}{'...' if len(action_args) > 30 else ''} | Sufficient: {stored_critique.is_sufficient}")
+             except Exception as e:
+                 logger.error(f"Failed to log step to Multion API: {e}")
 
-            except Exception as e:
-                logger.error(f"Failed to log step to Multion API: {e}")
-
-        # 7. Return the action string required by the AGI SDK harness
+        # 7. Return the action string
         return action_str, {} # Return empty dict as second element
+
+    def _construct_base_messages_for_graph(self, processed_obs: dict) -> List[BaseMessage]:
+        """Helper to construct the common part of messages list for graph nodes."""
+        # This is essentially the logic from the old _construct_prompt_messages, 
+        # minus the final step-specific instruction.
+        messages = []
+        # 1. System Prompt (Base instructions, Action Space)
+        system_prompt_base = f"""\
+# Instructions
+
+You are a UI Assistant operating a web browser to help a user or achieve a goal.
+Review the current state of the page, the user's request/goal, and your action/critique history.
+Your goal is to decide the single best next action to take through proposal and critique.
+
+# Action Space
+
+{self.action_set.describe(with_long_description=False, with_examples=True)}
+"""
+        messages.append(SystemMessage(content=system_prompt_base))
+        
+        # 2. Goal / Chat History
+        if self.chat_mode:
+            messages.append(HumanMessage(content="# Chat History\n(Review messages to understand user intent)"))
+            for msg in processed_obs["chat_messages"]:
+                role_prefix = f"[{msg['role'].upper()}]"
+                if msg["role"] == "user_image":
+                    messages.append(HumanMessage(content=f"{role_prefix} (User sent an image)"))
+                elif msg["role"] in ("user", "assistant", "infeasible"):
+                    messages.append(HumanMessage(content=f"{role_prefix} {msg['message']}"))
+                else:
+                    logger.warning(f"Unexpected chat message role {repr(msg['role'])}")
+                    messages.append(HumanMessage(content=f"[{msg['role'].upper()}] {msg['message']}"))
+        else: # Goal-oriented mode
+            goal_text = processed_obs.get("goal_object", "No goal specified.")
+            messages.append(HumanMessage(content=f"# Goal\n\n{str(goal_text)}"))
+            if isinstance(processed_obs.get("goal_object"), list):
+                for item in processed_obs["goal_object"]:
+                    if isinstance(item, dict) and 'type' in item and item['type'] == 'text' and 'text' in item:
+                        messages.append(HumanMessage(content=item['text']))
+                    elif isinstance(item, BaseMessage):
+                        messages.append(item)
+
+        # 3. Observation Details
+        obs_content = []
+        if self.use_axtree and processed_obs.get("axtree_txt"):
+            obs_content.append(f"# Current page Accessibility Tree\n\n{processed_obs['axtree_txt']}")
+        if self.use_html and processed_obs.get("pruned_html"):
+            obs_content.append(f"# Current page DOM (pruned)\n\n{processed_obs['pruned_html']}")
+        if self.use_screenshot and processed_obs.get("screenshot") is not None:
+            try:
+                img_url = image_to_jpg_base64_url(processed_obs["screenshot"])
+                obs_content.append("# Current page Screenshot")
+                messages.append(HumanMessage(content=[{"type": "text", "text": "\n".join(obs_content)}, {"type": "image_url", "image_url": {"url": img_url}}]))
+                obs_content = [] 
+            except Exception as e:
+                logger.error(f"Failed to process screenshot for prompt: {e}")
+                obs_content.append("# Current page Screenshot (Error processing image)")
+        if obs_content:
+            messages.append(HumanMessage(content="\n\n".join(obs_content)))
+
+        # 4. Action & Critique History
+        if self.action_history:
+            history_content = ["# History (Past Actions and Critiques)"]
+            for i, action in enumerate(self.action_history):
+                critique_text = "No critique recorded."
+                if i < len(self.reflection_history) and self.reflection_history[i]:
+                    critique: Critique = self.reflection_history[i]
+                    critique_text = f"  Critique: '{critique.critique}' (Sufficient: {critique.is_sufficient}, Missing: '{critique.missing}', Superfluous: '{critique.superfluous}')"
+                history_content.append(f"- Action: {action}\n{critique_text}")
+            if processed_obs.get("last_action_error"):
+                history_content.append(f"\n# Error message from last action\n\n{processed_obs['last_action_error']}")
+            messages.append(HumanMessage(content='\n'.join(history_content)))
+        
+        return messages
 
 
 @dataclasses.dataclass
