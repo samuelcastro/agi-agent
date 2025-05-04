@@ -77,6 +77,15 @@ class Critique(BaseModel):
     superfluous: str = Field(description="Critique of what is superfluous.")
 # --- End New Models --- 
 
+# --- Supervisor Model --- 
+class RoutingDecision(BaseModel):
+    """Decision on the next step in the agent's internal workflow."""
+    next_step: Literal["propose", "critique", "revise", "force_infeasible", "final_answer"] = Field(
+        description="The next node or action to take: 'propose' action, 'critique' proposal, 'revise' proposal, 'force_infeasible' if stuck/failed, or 'final_answer' if the last proposal is good."
+    )
+    reasoning: str = Field(description="Brief reasoning for the routing decision.")
+# --- End Supervisor Model --- 
+
 
 # Define LangGraph state
 class AgentState(TypedDict):
@@ -177,29 +186,40 @@ class DemoAgent(Agent):
         # --- LangGraph Setup ---
         builder = StateGraph(AgentState)
 
-        # Define the Nodes for the Reflexion loop
+        # Define Nodes
+        builder.add_node("supervisor", self._supervisor_node)
         builder.add_node("propose_action", self._propose_action_node)
         builder.add_node("critique_action", self._critique_action_node)
         builder.add_node("revise_action", self._revise_action_node)
+        # Potentially add a node for forced infeasibility if needed, or handle in supervisor
 
-        # Define edges 
-        builder.add_edge(START, "propose_action")
-        builder.add_edge("propose_action", "critique_action")
+        # Define Edges
+        builder.add_edge(START, "supervisor") # Start with the supervisor
+        
+        # Supervisor routes to propose, revise, or ends graph
         builder.add_conditional_edges(
-            "critique_action",
-            self._should_revise, # Function to decide route
+            "supervisor",
+            self._route_from_supervisor,
             {
-                "revise": "revise_action", # If critique says revise, go to revise node
-                END: END  # If critique says sufficient, end the graph
+                "propose": "propose_action",
+                "revise": "revise_action", # Allow supervisor to directly trigger revision
+                "force_infeasible": END, # Supervisor decision handled in get_action
+                "final_answer": END # Supervisor decision handled in get_action
             }
         )
-        # After revision, critique again (simple loop for now)
-        # In a more complex setup, revise_action could also lead to END
-        builder.add_edge("revise_action", "critique_action") 
-
+        
+        # Propose -> Critique
+        builder.add_edge("propose_action", "critique_action")
+        
+        # Critique -> Supervisor (Supervisor decides next step based on critique)
+        builder.add_edge("critique_action", "supervisor")
+        
+        # Revise -> Critique (Critique the revised action)
+        builder.add_edge("revise_action", "critique_action")
+        
         # Compile the graph
         self.graph = builder.compile()
-        # --- Visualize Graph --- Using Mermaid.live
+        # --- Visualize Graph ---
         try:
             print("--- LangGraph Mermaid Diagram ---")
             print(self.graph.get_graph().draw_mermaid())
@@ -343,6 +363,40 @@ Your goal is to decide the single best next action to take through proposal and 
         return messages
 
     # --- LangGraph Node Functions --- 
+
+    def _supervisor_node(self, state: AgentState) -> dict:
+        """Supervisor node to analyze state and decide routing."""
+        logger.info("Invoking supervisor node...")
+        
+        # Simple initial logic: Always propose first if no proposal exists.
+        # More complex logic can be added later (check history, errors, loops).
+        if state.get("proposed_action") is None:
+             logger.info("Supervisor: No proposal yet, routing to propose.")
+             # Return routing decision WITHOUT calling LLM for now
+             return {"supervisor_decision": RoutingDecision(next_step="propose", reasoning="Initial step.")} 
+        
+        # If there's a critique, analyze it
+        critique = state.get("critique")
+        revision_attempts = state.get("revision_attempts", 0)
+        max_revisions = 1
+        
+        if critique:
+            if not critique.is_sufficient and revision_attempts < max_revisions:
+                logger.info(f"Supervisor: Critique insufficient (Attempt {revision_attempts + 1}), routing to revise.")
+                # Decide to revise
+                # Update state might happen implicitly via edge logic, or explicitly here
+                return {"supervisor_decision": RoutingDecision(next_step="revise", reasoning="Critique requires revision.")}
+            else:
+                if critique.is_sufficient:
+                     logger.info("Supervisor: Critique sufficient, routing to final_answer.")
+                     return {"supervisor_decision": RoutingDecision(next_step="final_answer", reasoning="Critique approved action.")}
+                elif revision_attempts >= max_revisions:
+                     logger.warning(f"Supervisor: Max revisions ({max_revisions}) reached, routing to final_answer with last proposal.")
+                     return {"supervisor_decision": RoutingDecision(next_step="final_answer", reasoning="Max revisions reached.")}
+        
+        # Default / Fallback (should ideally not be reached with current logic)
+        logger.warning("Supervisor: Fallback routing to propose.")
+        return {"supervisor_decision": RoutingDecision(next_step="propose", reasoning="Fallback decision.")}
 
     def _propose_action_node(self, state: AgentState) -> dict:
         """Node that invokes the LLM to propose an action and reasoning."""
@@ -489,24 +543,16 @@ Your goal is to decide the single best next action to take through proposal and 
 
     # --- Conditional Edge Logic --- 
 
-    def _should_revise(self, state: AgentState) -> Literal["revise", END]:
-        """Determine whether to revise the action based on the critique."""
-        logger.info("Checking critique to decide whether to revise...")
-        critique = state.get("critique")
-        revision_attempts = state.get("revision_attempts", 0)
-        max_revisions = 1 # Set a limit for revisions
-
-        if critique and not critique.is_sufficient and revision_attempts < max_revisions:
-            logger.info(f"Critique not sufficient (Attempt {revision_attempts + 1}). Revising.")
-            return "revise"
-        else:
-            if critique and critique.is_sufficient:
-                 logger.info("Critique sufficient. Proceeding.")
-            elif revision_attempts >= max_revisions:
-                 logger.warning(f"Max revision attempts ({max_revisions}) reached. Proceeding with last proposal.")
-            else:
-                 logger.warning("No critique found, proceeding with proposed action.")
-            return END
+    def _route_from_supervisor(self, state: AgentState) -> Literal["propose", "revise", "force_infeasible", "final_answer"]:
+        """Reads the supervisor decision from state and returns the routing target."""
+        decision = state.get("supervisor_decision")
+        if decision:
+             # Handle force_infeasible and final_answer as END signals for the conditional edge
+             if decision.next_step in ["force_infeasible", "final_answer"]:
+                  return END
+             return decision.next_step
+        logger.warning("Supervisor decision not found in state, defaulting to propose.")
+        return "propose" # Fallback routing
 
     def get_action(self, obs: dict) -> tuple[str, dict]:
         # 1. Preprocess observation (if needed, but harness usually does it)
@@ -521,44 +567,53 @@ Your goal is to decide the single best next action to take through proposal and 
         # 3. Invoke the LangGraph graph with initial state
         graph_input = {
              "messages": initial_messages,
-             "revision_attempts": 0 # Initialize revision counter
-             # Pass other necessary initial state if AgentState definition changes
+             "proposed_action": None, # Explicitly start with no proposal
+             "critique": None,        # Explicitly start with no critique
+             "revision_attempts": 0 
         }
-        logger.info("Invoking Reflexion graph...")
+        logger.info("Invoking Supervisor graph...")
         final_state = self.graph.invoke(graph_input)
-        logger.info("Reflexion graph finished.")
+        logger.info("Supervisor graph finished.")
 
         # 4. Parse the FINAL action and critique from the final state
-        final_action = final_state.get("proposed_action")
+        final_supervisor_decision = final_state.get("supervisor_decision")
+        final_proposed_action = final_state.get("proposed_action")
         final_critique = final_state.get("critique")
 
-        action_str = "report_infeasible(\"Error: Could not determine final action after reflexion.\")" # Default fallback
-        stored_critique = Critique(critique="Graph execution failed to produce final critique.", is_sufficient=False, missing="N/A", superfluous="N/A")
+        action_str = "report_infeasible(\"Error: Could not determine final action after supervisor review.\")"
+        stored_critique = final_critique # Store the last critique generated
 
-        if final_action:
-            action_str = final_action.action
-            logger.info(f"Final Action Chosen: {action_str}")
+        if final_supervisor_decision:
+             if final_supervisor_decision.next_step == "force_infeasible":
+                  action_str = f"report_infeasible(\"Supervisor forced stop: {final_supervisor_decision.reasoning}\")"
+                  logger.warning(f"Supervisor forced infeasible: {final_supervisor_decision.reasoning}")
+             elif final_supervisor_decision.next_step == "final_answer" and final_proposed_action:
+                  action_str = final_proposed_action.action
+                  logger.info(f"Final Action Chosen (approved by supervisor): {action_str}")
+             elif final_proposed_action: # Fallback if supervisor ended unexpectedly but proposal exists
+                  logger.warning("Supervisor ended unexpectedly, using last proposed action.")
+                  action_str = final_proposed_action.action
+             # Else: keep the default infeasible action
+        elif final_proposed_action: # Fallback if supervisor node failed entirely
+             logger.error("Supervisor decision missing, using last proposed action as fallback.")
+             action_str = final_proposed_action.action
         else:
-            logger.error("Final state did not contain a proposed_action.")
+             logger.error("Supervisor decision and final proposal missing.")
+
+        # Ensure stored_critique is a Critique object, provide default if None
+        if not isinstance(stored_critique, Critique):
+            stored_critique = Critique(critique="No valid critique generated or graph failed.", is_sufficient=False, missing="N/A", superfluous="N/A")
         
-        if final_critique:
-            stored_critique = final_critique
-            logger.info(f"Final Critique: {stored_critique.critique[:50]}... | Sufficient: {stored_critique.is_sufficient}")
-        else:
-            # This might happen if the graph ends before critique if propose fails badly
-            logger.warning("Final state did not contain a critique.")
-
         # 5. Store action and *final critique* history
         self.action_history.append(action_str)
-        # Store the Critique object itself
-        self.reflection_history.append(stored_critique) 
+        self.reflection_history.append(stored_critique)
 
         # 6. Log step via AgentLogger (if enabled)
         if hasattr(self, 'agent_logger') and self.agent_logger is not None:
              try:
-                 inputs = { # ... (same as before) ...
-                    "prompt_summary": "Prompt constructed with history and reflection.", 
-                    "observation": { 
+                 inputs = {
+                    "prompt_summary": "Supervisor Graph Invoked", # Updated summary
+                    "observation": {
                         "num_chat_messages": len(processed_obs.get("chat_messages", [])),
                         "has_screenshot": "screenshot" in processed_obs and processed_obs["screenshot"] is not None,
                         "has_axtree": "axtree_txt" in processed_obs and processed_obs["axtree_txt"] is not None,
@@ -575,15 +630,18 @@ Your goal is to decide the single best next action to take through proposal and 
                      "critique_superfluous": stored_critique.superfluous,
                      "critique_sufficient": stored_critique.is_sufficient,
                      "critique_text": stored_critique.critique,
+                     "supervisor_decision": final_supervisor_decision.next_step if final_supervisor_decision else "N/A"
                  }
                  # self.agent_logger.log_step(inputs, outputs) # Uncomment if AgentLogger is available
 
                  action_type = action_str.split("(")[0] if "(" in action_str else "unknown"
                  action_args = action_str.split("(", 1)[1].rstrip(")") if "(" in action_str else ""
                  step_count = len(self.action_history)
-                 print(f"Step {step_count}: {action_type} {action_args[:30]}{'...' if len(action_args) > 30 else ''} | Sufficient: {stored_critique.is_sufficient}")
+                 # Update print log to show supervisor decision if available
+                 supervisor_info = f" | Supervisor: {final_supervisor_decision.next_step}" if final_supervisor_decision else ""
+                 print(f"Step {step_count}: {action_type} {action_args[:30]}{'...' if len(action_args) > 30 else ''}{supervisor_info}")
              except Exception as e:
-                 logger.error(f"Failed to log step to Multion API: {e}")
+                 logger.error(f"Failed to log step: {e}")
 
         # 7. Return the action string
         return action_str, {} # Return empty dict as second element
