@@ -10,7 +10,6 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-# --- Reusable Helper Functions ---
 def image_to_jpg_base64_url(image: np.ndarray | Image.Image):
     """Convert a numpy array to a base64 encoded image url."""
     if isinstance(image, np.ndarray):

@@ -1,8 +1,6 @@
 import logging
 from typing import Tuple, Optional, Dict, List
 from openai import OpenAI
-
-# Assuming BaseSubAgent is in common.py
 from .common import BaseSubAgent
 
 logger = logging.getLogger(__name__)

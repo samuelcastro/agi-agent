@@ -2,7 +2,6 @@ import logging
 import re
 from typing import Dict, Optional, List
 from openai import OpenAI
-
 from .common import BaseSubAgent, image_to_jpg_base64_url 
 
 logger = logging.getLogger(__name__)
