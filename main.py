@@ -36,6 +36,9 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # from rl_training.agents.agent_logger_class import AgentLogger
 
+# Import the new multi-agent components
+from multi_agent import OrchestratorAgentArgs
+
 # Configure logging with more detailed output
 logging.basicConfig(
     level=logging.INFO,
@@ -502,17 +505,24 @@ class DemoAgentArgs(AbstractAgentArgs):
         )
 
 
-# Example creating and using the DemoAgent
+# Example creating and using the DemoAgent (Now OrchestratorAgent)
 def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_id=None, task_name="webclones.omnizon-1"):    
     # Create the agent arguments with the specified parameters
-    agent_args = DemoAgentArgs(
-        model_name=model_name,
-        chat_mode=False,
-        demo_mode="off",
-        use_html=False,
-        use_axtree=True,
-        use_screenshot=True,
-        system_message_handling="separate"
+    # agent_args = DemoAgentArgs(
+    #     model_name=model_name,
+    #     chat_mode=False,
+    #     demo_mode="off",
+    #     use_html=False,
+    #     use_axtree=True,
+    #     use_screenshot=True,
+    #     system_message_handling="separate"
+    # )
+    
+    # Use the new OrchestratorAgent arguments
+    agent_args = OrchestratorAgentArgs(
+        model_name=model_name
+        # Add any specific config needed for OrchestratorAgentArgs here
+        # e.g., use_screenshot=True, use_axtree=True
     )
     
     # Pass the agent arguments to the harness through the agisdk module
@@ -524,8 +534,11 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
         task_type="omnizon",
         headless=True,          # Configurable browser visibility
         max_steps=25,               # Maximum steps per task
-        use_axtree=agent_args.use_axtree,         # Pass through from agent args
-        use_screenshot=agent_args.use_screenshot,  # Pass through from agent args
+        # Ensure these match how obs data is used in Planner/Actor
+        # Pass relevant args from agent_args if needed
+        use_axtree=True,         # Example: Assuming AXTree is needed
+        use_screenshot=False,  # Example: Assuming Screenshot is not needed by default
+        # use_html=False,
         leaderboard=leaderboard,    # Whether to submit to leaderboard
         run_id=run_id,              # Run ID for leaderboard submission
         use_cache=False
@@ -544,4 +557,6 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
 
 if __name__ == "__main__":
     # Run the agent with the specified parameters
+    # Make sure the agent logger logic (if used) is compatible or removed/updated
+    # Currently, AgentLogger is commented out in DemoAgent and not added to OrchestratorAgent
     results = run_demo_agent()
