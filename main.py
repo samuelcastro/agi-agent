@@ -381,11 +381,16 @@ Briefly explain how the history of actions informs your next step towards the go
         user_msgs.append(
             {
                 "type": "text",
-                "text": f"""\n# Reflection
+                "text": f"""# Reflection & Planning
 
-Review your progress towards the goal: '{obs["goal_object"]}'. 
-Assess the effectiveness of your previous actions based on the history and current page state. 
-Briefly state your current high-level plan or if you need to adjust it.
+Review your progress towards the goal: '{obs["goal_object"]}'.
+Assess the effectiveness of your previous actions based on the history and current page state.
+Briefly state your current high-level plan. **Then, outline the next 1-3 specific steps you intend to take.**
+
+Example Plan Outline:
+1. Fill the 'username' field (bid=25) with 'testuser'.
+2. Fill the 'password' field (bid=28) with 'password123'.
+3. Click the 'Login' button (bid=30).
 """
             }
         )
@@ -520,6 +525,7 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
         use_screenshot=agent_args.use_screenshot,  # Pass through from agent args
         leaderboard=leaderboard,    # Whether to submit to leaderboard
         run_id=run_id,              # Run ID for leaderboard submission
+        use_cache=False
     )
     
     # Run the task
