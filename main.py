@@ -518,11 +518,8 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
     #     system_message_handling="separate"
     # )
     
-    # Use the new OrchestratorAgent arguments
     agent_args = OrchestratorAgentArgs(
         model_name=model_name
-        # Add any specific config needed for OrchestratorAgentArgs here
-        # e.g., use_screenshot=True, use_axtree=True
     )
     
     # Pass the agent arguments to the harness through the agisdk module
