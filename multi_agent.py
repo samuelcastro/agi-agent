@@ -205,10 +205,9 @@ Analyze this error and try to achieve the plan step (`{current_plan_step}`) succ
 
 class CriticAgent(BaseSubAgent):
     def __init__(self, client: OpenAI, model_name: str):
-        # No LLM needed for rule-based critic yet
-        # super().__init__(client, model_name) 
-        pass
-        
+        # LLM is now needed, call the parent initializer
+        super().__init__(client, model_name) 
+
     def evaluate_action(self, obs: dict, current_plan_step: str, proposed_action: str) -> Tuple[bool, str]:
         """Evaluates a proposed action using an LLM. Returns (is_valid, critique_message)."""
         logger.info(f"Critic evaluating action: {proposed_action} for step: {current_plan_step}")
