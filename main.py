@@ -257,7 +257,7 @@ class DemoAgent(Agent):
             self.agent_logger = None
 
         # Remove the old query_model function
-        # self.query_model = query_model # Removed
+        # self.query_model = query_model
 
     def _construct_prompt_messages(self, processed_obs: dict, current_step: Literal["propose", "critique", "revise"]) -> List[BaseMessage]:
         """Helper to construct the list of messages for the LLM, tailored to the current step."""
