@@ -150,13 +150,19 @@ class ActorAgent(BaseSubAgent):
         if obs.get("last_action_error"):
             user_prompt_content.append({
                 "type": "text",
-                "text": f"""
-# Error message from last attempt at this step
+                "text": f"""\n# Error message from last attempt at this step
 
 {obs["last_action_error"]}
 
 Analyze this error and try to achieve the plan step (`{current_plan_step}`) successfully now.
 """
+            })
+        
+        # Include last critique if present (from rule-based critic)
+        if obs.get('last_action_critique'):
+             user_prompt_content.append({
+                "type": "text",
+                "text": f"""\n# Critique of your last proposed action for this step\n\n{obs['last_action_critique']}\n\nAddress this critique in your next action proposal for the plan step (`{current_plan_step}`).\n"""
             })
 
         # Ask for the single action
@@ -197,10 +203,63 @@ Analyze this error and try to achieve the plan step (`{current_plan_step}`) succ
                 # Fallback action if extraction fails
                 return 'send_msg_to_user("Internal error: Actor failed to parse action response.")'
 
-class CriticAgent(BaseSubAgent): # Optional
-    def evaluate_action(self, obs: dict, proposed_action: str) -> bool:
-        # Implementation needed: Create prompt, call LLM, return critique (e.g., True=OK, False=Bad)
+class CriticAgent(BaseSubAgent):
+    def __init__(self, client: OpenAI, model_name: str):
+        # No LLM needed for rule-based critic yet
+        # super().__init__(client, model_name) 
         pass
+        
+    def evaluate_action(self, obs: dict, current_plan_step: str, proposed_action: str) -> Tuple[bool, str]:
+        """Evaluates a proposed action using an LLM. Returns (is_valid, critique_message)."""
+        logger.info(f"Critic evaluating action: {proposed_action} for step: {current_plan_step}")
+
+        system_prompt = (
+            "You are a meticulous critic agent. Your task is to evaluate if a proposed browser action "
+            "is valid and appropriate given the current web page state (AXTree) and the specific plan step "
+            "it is supposed to achieve. Focus on validity (Does the element likely exist? Is the action type suitable?) "
+            "and relevance (Does this action directly help achieve the current plan step?). "
+            "Consider any previous error messages." 
+        )
+
+        user_prompt_content = []
+        user_prompt_content.append({"type": "text", "text": f"# Goal\n{obs.get('goal_object', 'N/A')}"})
+        user_prompt_content.append({"type": "text", "text": f"\n# Current Plan Step\n{current_plan_step}"})
+        
+        if obs.get("axtree_txt"):
+            user_prompt_content.append({"type": "text", "text": f"\n# Current Page Accessibility Tree\n{obs['axtree_txt']}"})
+        # Optionally add HTML or screenshot if needed
+
+        user_prompt_content.append({"type": "text", "text": f"\n# Actor's Proposed Action\n```{proposed_action}```"})
+
+        if obs.get("last_action_error"):
+            user_prompt_content.append({"type": "text", "text": f"\n# Last Action Error (for context)\n{obs['last_action_error']}"})
+
+        user_prompt_content.append({
+            "type": "text", 
+            "text": ("\n# Evaluation\nIs the proposed action valid and relevant for the current plan step, given the page state and potential errors? "
+                     "Respond ONLY with the word 'Valid.' or 'Invalid.' followed by a concise reason. "
+                     "Example Valid: Valid. The click action targets an existing button relevant to the step. "
+                     "Example Invalid: Invalid. The proposed bid does not exist in the AXTree. "
+                     "Example Invalid: Invalid. select_option cannot be used on a div element.")
+        })
+
+        llm_response = self._query_model(system_prompt, user_prompt_content)
+
+        if llm_response.startswith("ERROR:"):
+            logger.error(f"Critic LLM query failed: {llm_response}")
+            # Default to invalid if LLM fails
+            return False, f"Critic LLM query failed: {llm_response}"
+
+        # Parse response
+        response_lower = llm_response.lower().strip()
+        if response_lower.startswith("valid"):
+            logger.info(f"Critic approves action. Reason: {llm_response}")
+            # Return the full response as the critique message for context
+            return True, llm_response 
+        else:
+            # Assume invalid otherwise
+            logger.warning(f"Critic rejects action. Reason: {llm_response}")
+            return False, llm_response
 
 # --- Orchestrator Agent Implementation ---
 
@@ -211,6 +270,7 @@ class OrchestratorAgent(REAL.Agent):
         self.state = AgentState.NEEDS_PLAN
         self.current_plan: List[str] = []
         self.current_plan_step_index: int = 0
+        self.last_critique: str = "" # Store critique for Actor retry
 
         # Initialize OpenAI Client
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -220,12 +280,11 @@ class OrchestratorAgent(REAL.Agent):
         self.client = OpenAI(api_key=openai_api_key)
 
         # Initialize Sub-Agents
-        self.planner = PlannerAgent(self.client, args.model_name) # Use same model for now
-        self.actor = ActorAgent(self.client, args.model_name)     # Use same model for now
-        # self.critic = CriticAgent(self.client, args.critic_model_name) # If using critic
+        self.planner = PlannerAgent(self.client, args.model_name)
+        self.actor = ActorAgent(self.client, args.model_name)
+        self.critic = CriticAgent(self.client, args.model_name) # Client/model not used yet
 
         # Initialize Action Set for Actor prompts
-        # TODO: Pass relevant args like demo_mode from OrchestratorAgentArgs if needed
         self.action_set = HighLevelActionSet(
             subsets=["chat", "bid", "infeas"],
             strict=False,
@@ -283,25 +342,55 @@ class OrchestratorAgent(REAL.Agent):
                 current_step_text = self.current_plan[self.current_plan_step_index]
                 logger.info(f"Executing plan step {self.current_plan_step_index}: '{current_step_text}'")
                 
+                # --- Actor-Critic Interaction Loop (Simplified: 1 attempt + critique) ---
+                # Add last critique to observation if retrying after critique
+                if self.last_critique:
+                    obs['last_action_critique'] = self.last_critique # Add critique info
+
                 # Get action proposal from Actor
-                action_str = self.actor.propose_action(obs, current_step_text, self.action_set_description)
+                proposed_action_str = self.actor.propose_action(obs, current_step_text, self.action_set_description)
+                
+                # Reset critique after Actor uses it
+                self.last_critique = "" 
+                obs.pop('last_action_critique', None) # Clean up obs
+
+                # Validate with Critic (if enabled)
+                is_valid_action = True # Assume valid if critic is disabled
+                critique = "Critic disabled."
+                if self.args.use_critic:
+                    is_valid_action, critique = self.critic.evaluate_action(obs, current_step_text, proposed_action_str)
+
+                action_str = proposed_action_str 
                 metadata = {"plan_step_index": self.current_plan_step_index, "plan_step_text": current_step_text}
 
-                # --- Plan Advancement Logic ---
-                # Advance the plan *only if* the previous action (related to the previous index) was successful.
-                # We check the error from the *current* observation, which reflects the result of the *last* action taken.
-                if not is_retrying and not action_str.startswith("ERROR:"): # If last action succeeded and Actor didn't fail
-                    # Check if actor returned a failure message itself
-                    if not action_str.startswith('send_msg_to_user("Internal error:'):
-                       self.current_plan_step_index += 1
-                       logger.info(f"Advancing to plan step {self.current_plan_step_index}")
-                    else:
-                        logger.warning("Actor returned an internal error message, not advancing plan.")
-                elif is_retrying:
-                    logger.info("Not advancing plan index because this was a retry.")
-                else: # Actor failed internally
-                     logger.error(f"Actor failed to propose a valid action for step {self.current_plan_step_index}. Not advancing plan.")
-                    # State remains EXECUTING_PLAN, will retry on next call
+                # If Critic rejects, store critique and prepare for retry on next step
+                if not is_valid_action:
+                    logger.warning(f"Critic rejected action: {critique}")
+                    self.last_critique = critique
+                    metadata["critique_result"] = f"Rejected: {critique}"
+                    # Still return the proposed (invalid) action for the env to potentially error on
+                    # Plan advancement is blocked below.
+                else:
+                    # Action approved by critic or critic disabled
+                    metadata["critique_result"] = "Approved" if self.args.use_critic else "Approval N/A (Critic Disabled)"
+                    
+                    # --- Plan Advancement Logic --- 
+                    # Advance plan *only if* the critic approved (or is disabled)
+                    # AND the last *execution* attempt was successful (or this is a valid retry)
+                    if not is_retrying: # Last execution succeeded
+                         if not action_str.startswith('send_msg_to_user("Internal error:'):
+                             self.current_plan_step_index += 1
+                             logger.info(f"Advancing to plan step {self.current_plan_step_index} after successful execution and critique approval.")
+                         else:
+                            logger.warning("Actor returned an internal error message, not advancing plan.")
+                    else: # Last execution failed (we are retrying)
+                        # Since the critic *approved* this new action (or is disabled), 
+                        # we assume this retry is valid and advance the plan.
+                        if not action_str.startswith('send_msg_to_user("Internal error:'):
+                            self.current_plan_step_index += 1
+                            logger.info(f"Advancing to plan step {self.current_plan_step_index} after successful retry and critique approval.")
+                        else:
+                             logger.warning("Actor returned an internal error message on retry, not advancing plan.")
 
             else:
                 logger.error(f"Orchestrator entered unknown state: {self.state}")
@@ -324,12 +413,14 @@ class OrchestratorAgentArgs(REAL.AbstractAgentArgs):
     # critic_model_name: str = "gpt-4o"
 
     # Observation config (pass these down if sub-agents need them)
-    # use_screenshot: bool = False
+    use_screenshot: bool = False
     # use_axtree: bool = True 
     # use_html: bool = False
 
     # ActionSet config
     # demo_mode: str = "off"
+
+    use_critic: bool = True # Add option to enable/disable critic
 
     def make_agent(self) -> OrchestratorAgent:
         logger.info(f"Creating OrchestratorAgent with args: {self}")
