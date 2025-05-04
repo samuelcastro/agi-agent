@@ -199,7 +199,7 @@ class DemoAgent(Agent):
 
         # Compile the graph
         self.graph = builder.compile()
-        # --- Visualize Graph (Optional) ---
+        # --- Visualize Graph --- Using Mermaid.live
         try:
             print("--- LangGraph Mermaid Diagram ---")
             print(self.graph.get_graph().draw_mermaid())
