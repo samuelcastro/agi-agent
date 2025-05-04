@@ -385,9 +385,9 @@ Briefly explain how the history of actions informs your next step towards the go
 
 Review your progress towards the goal: '{obs["goal_object"]}'.
 Assess the effectiveness of your previous actions based on the history and current page state.
-Briefly state your current high-level plan. **Then, outline the next 1-3 specific steps you intend to take.**
+Briefly state your current high-level plan. **Then, outline the next 1-3 specific steps you *think* you will take. This plan is for your reasoning only.**
 
-Example Plan Outline:
+Example Plan Outline (for reasoning only):
 1. Fill the 'username' field (bid=25) with 'testuser'.
 2. Fill the 'password' field (bid=28) with 'password123'.
 3. Click the 'Login' button (bid=30).
@@ -399,11 +399,14 @@ Example Plan Outline:
         user_msgs.append(
             {
                 "type": "text",
-                "text": f"""\
-                            # Next action
+                "text": f"""\n# Next action
 
-                            You will now think step by step and produce your next best action. Reflect on your past actions, any resulting error message, the current state of the page before deciding on your next action.
-                            """,
+Based on your reflection and plan, think step by step and produce **only the single, immediate next action** required to progress towards the goal. 
+Your final answer MUST be ONLY the action call, enclosed in markdown code fences.
+
+Example final output:
+```click("12")```
+"""
             }
         )
 
