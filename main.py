@@ -89,12 +89,15 @@ class RoutingDecision(BaseModel):
 
 # Define LangGraph state
 class AgentState(TypedDict):
+    # Base context (System, Goal, Obs, History) constructed once per get_action call
+    initial_messages: List[BaseMessage] 
+    # Running message list for the current internal graph execution
     messages: Annotated[List[BaseMessage], add_messages]
-    # Add state for the multi-step reflexion process
+    # Fields updated by the graph nodes
     proposed_action: Optional[ProposedAction] = None
     critique: Optional[Critique] = None
-    revision_attempts: int = 0 # To limit loops
-    # We might add more state elements later if needed (e.g., original_input)
+    supervisor_decision: Optional[RoutingDecision] = None # Added field for supervisor output
+    revision_attempts: int = 0 
 
 
 # Handling Screenshots
@@ -367,24 +370,18 @@ Your goal is to decide the single best next action to take through proposal and 
     def _supervisor_node(self, state: AgentState) -> dict:
         """Supervisor node to analyze state and decide routing."""
         logger.info("Invoking supervisor node...")
-        
-        # Simple initial logic: Always propose first if no proposal exists.
-        # More complex logic can be added later (check history, errors, loops).
+        # (Rule-based logic remains the same for now)
+        # It reads proposed_action and critique from state
+        # It returns {"supervisor_decision": ...}
         if state.get("proposed_action") is None:
              logger.info("Supervisor: No proposal yet, routing to propose.")
-             # Return routing decision WITHOUT calling LLM for now
              return {"supervisor_decision": RoutingDecision(next_step="propose", reasoning="Initial step.")} 
-        
-        # If there's a critique, analyze it
         critique = state.get("critique")
         revision_attempts = state.get("revision_attempts", 0)
         max_revisions = 1
-        
         if critique:
             if not critique.is_sufficient and revision_attempts < max_revisions:
                 logger.info(f"Supervisor: Critique insufficient (Attempt {revision_attempts + 1}), routing to revise.")
-                # Decide to revise
-                # Update state might happen implicitly via edge logic, or explicitly here
                 return {"supervisor_decision": RoutingDecision(next_step="revise", reasoning="Critique requires revision.")}
             else:
                 if critique.is_sufficient:
@@ -393,45 +390,31 @@ Your goal is to decide the single best next action to take through proposal and 
                 elif revision_attempts >= max_revisions:
                      logger.warning(f"Supervisor: Max revisions ({max_revisions}) reached, routing to final_answer with last proposal.")
                      return {"supervisor_decision": RoutingDecision(next_step="final_answer", reasoning="Max revisions reached.")}
-        
-        # Default / Fallback (should ideally not be reached with current logic)
-        logger.warning("Supervisor: Fallback routing to propose.")
-        return {"supervisor_decision": RoutingDecision(next_step="propose", reasoning="Fallback decision.")}
+        logger.warning("Supervisor: Fallback routing to propose (critique missing?).") # Added more context
+        return {"supervisor_decision": RoutingDecision(next_step="propose", reasoning="Fallback decision - critique missing?")}
 
     def _propose_action_node(self, state: AgentState) -> dict:
         """Node that invokes the LLM to propose an action and reasoning."""
         logger.info("Invoking propose_action node...")
-        # Construct prompt specifically for proposal
-        # Need access to observation data - how is it passed? Assume it's part of initial state['messages'] or accessible via self?
-        # For now, assume initial messages are correctly in state["messages"]
-        # We need to reconstruct the prompt messages here using the state
-        # This requires passing the original observation into the graph state or accessing it via self.
-        # Let's assume we modify get_action to put obs in state later.
-        # For now, we work with the messages already in state.
-
-        # Bind the ProposedAction tool
         propose_llm = self.llm.bind_tools(tools=[ProposedAction], tool_choice=ProposedAction.__name__)
-        
         try:
-            # Add the step-specific instruction
-            current_messages = state['messages'] + [HumanMessage(content=f"# Task: Propose Action\n\nBased on the goal, observations, and history, propose the best single next action and your reasoning for it. Use the {ProposedAction.__name__} tool.")]
-            response = propose_llm.invoke(current_messages)
+            # Use INITIAL messages + Task instruction
+            prompt_messages = state['initial_messages'] + [
+                HumanMessage(content=f"# Task: Propose Action\n\nBased on the goal, observations, and history, propose the best single next action and your reasoning for it. Use the {ProposedAction.__name__} tool.")
+            ]
+            response = propose_llm.invoke(prompt_messages)
 
             if not response.tool_calls or response.tool_calls[0]['name'] != ProposedAction.__name__:
                 logger.error(f"LLM did not return the expected {ProposedAction.__name__} tool call.")
-                # Handle error - maybe raise or return a default error state?
-                # For now, create a dummy response to avoid breaking graph flow
                 fallback_proposal = ProposedAction(action="report_infeasible('Proposal node failed')", reasoning="LLM failed format.")
                 response = AIMessage(content="", tool_calls=[{"id": "tool_fallback_propose", "name": ProposedAction.__name__, "args": fallback_proposal.dict()}])
             
-            # Parse and store the proposed action in the state
             parsed_proposal: ProposedAction = PydanticToolsParser(tools=[ProposedAction]).invoke(response)[0]
             logger.info(f"Proposed Action: {parsed_proposal.action}, Reasoning: {parsed_proposal.reasoning[:50]}...")
-            # Update state: add AI response and the parsed proposal object
-            return {"messages": [response], "proposed_action": parsed_proposal, "revision_attempts": 0} 
+            # Return ONLY the new message and the proposal object
+            return {"messages": [response], "proposed_action": parsed_proposal} 
         except Exception as e:
             logger.error(f"Error in propose_action_node: {e}")
-            # Handle error state
             fallback_proposal = ProposedAction(action="report_infeasible('Error in proposal node')", reasoning=f"Exception: {e}")
             response = AIMessage(content="", tool_calls=[{"id": "tool_error_propose", "name": ProposedAction.__name__, "args": fallback_proposal.dict()}])
             return {"messages": [response], "proposed_action": fallback_proposal}
@@ -442,49 +425,29 @@ Your goal is to decide the single best next action to take through proposal and 
         proposed_action = state.get("proposed_action")
         if not proposed_action:
              logger.error("Critique node called without a proposed action in state.")
-             # Handle error - maybe skip critique or return error state?
              fallback_critique = Critique(critique="No action proposed for critique.", is_sufficient=False, missing="Proposal step failed.", superfluous="N/A")
-             return {"critique": fallback_critique} # Don't add messages if proposal was missing
+             return {"critique": fallback_critique} 
 
-        # Bind the Critique tool
         critique_llm = self.llm.bind_tools(tools=[Critique], tool_choice=Critique.__name__)
-        
         try:
-            # Construct messages for critique: Use the base history, but EXCLUDE the last AI message 
-            # from the proposal step (which has the un-responded-to tool call). 
-            # Add the proposal details as a separate HumanMessage.
-            base_messages = state['messages']
-            # Filter out the last message if it's an AIMessage with the proposal tool call
-            if (
-                base_messages and 
-                isinstance(base_messages[-1], AIMessage) and 
-                base_messages[-1].tool_calls and 
-                base_messages[-1].tool_calls[0]['name'] == ProposedAction.__name__
-            ):
-                 critique_prompt_messages = base_messages[:-1] # Exclude the last message
-            else:
-                 critique_prompt_messages = base_messages # Use as is if last message wasn't the proposal AI msg
-            
-            critique_prompt_messages = critique_prompt_messages + [
+            # Use INITIAL messages + Proposal info + Task instruction
+            prompt_messages = state['initial_messages'] + [
                  HumanMessage(content=f"# Proposed Action for Critique\nAction: `{proposed_action.action}`\nReasoning: {proposed_action.reasoning}"),
-                 HumanMessage(content=f"# Task: Critique Proposed Action\n\Critically evaluate the proposed action and reasoning. Is it the best possible action? Is it safe? Does it directly address the goal and consider the history/errors? Provide detailed feedback. Use the {Critique.__name__} tool.")
+                 HumanMessage(content=f"# Task: Critique Proposed Action\n\Critically evaluate the proposed action and reasoning. Use the {Critique.__name__} tool.")
              ]
-            response = critique_llm.invoke(critique_prompt_messages)
+            response = critique_llm.invoke(prompt_messages)
 
             if not response.tool_calls or response.tool_calls[0]['name'] != Critique.__name__:
                  logger.error(f"LLM did not return the expected {Critique.__name__} tool call.")
-                 # Handle error
-                 fallback_critique = Critique(critique="LLM failed to provide critique.", is_sufficient=True, missing="Critique format error.", superfluous="N/A") # Default to sufficient to avoid infinite loop on format error
+                 fallback_critique = Critique(critique="LLM failed to provide critique.", is_sufficient=True, missing="Critique format error.", superfluous="N/A") 
                  response = AIMessage(content="", tool_calls=[{"id": "tool_fallback_critique", "name": Critique.__name__, "args": fallback_critique.dict()}])
 
-            # Parse and store the critique
             parsed_critique: Critique = PydanticToolsParser(tools=[Critique]).invoke(response)[0]
             logger.info(f"Critique: {parsed_critique.critique[:50]}... | Sufficient: {parsed_critique.is_sufficient}")
-            # Update state: add AI response and the parsed critique object
+            # Return ONLY the new message and the critique object
             return {"messages": [response], "critique": parsed_critique}
         except Exception as e:
              logger.error(f"Error in critique_action_node: {e}")
-             # Handle error state
              fallback_critique = Critique(critique=f"Exception during critique: {e}", is_sufficient=True, missing="Critique step failed.", superfluous="N/A")
              response = AIMessage(content="", tool_calls=[{"id": "tool_error_critique", "name": Critique.__name__, "args": fallback_critique.dict()}])
              return {"messages": [response], "critique": fallback_critique}
@@ -495,42 +458,27 @@ Your goal is to decide the single best next action to take through proposal and 
         proposed_action = state.get("proposed_action")
         critique = state.get("critique")
         if not proposed_action or not critique:
-            logger.error("Revise node called without proposed action or critique.")
-            return {}
+             logger.error("Revise node called without proposed action or critique.")
+             return {}
 
-        # Bind the ProposedAction tool (for the *revised* action)
         revise_llm = self.llm.bind_tools(tools=[ProposedAction], tool_choice=ProposedAction.__name__)
-
         try:
-            # Construct messages for revision: Use base history, exclude intermediate AI calls, add proposal + critique
-            base_messages = state['messages']
-            # Filter out AI messages with tool calls that haven't been responded to
-            revision_base_messages = []
-            for i, msg in enumerate(base_messages):
-                # Add message if it's not an AI message with tool calls OR 
-                # if it IS an AI message with tool calls but the *next* message is a ToolMessage
-                if not (isinstance(msg, AIMessage) and msg.tool_calls):
-                     revision_base_messages.append(msg)
-                elif i + 1 < len(base_messages) and isinstance(base_messages[i+1], ToolMessage):
-                     revision_base_messages.append(msg) # Include if it has a corresponding ToolMessage (though we aren't adding ToolMessages yet)
-                 # Otherwise, skip the AI message with unfulfilled tool calls
-
-            revision_prompt_messages = revision_base_messages + [
+            # Use INITIAL messages + Previous Proposal + Critique + Task instruction
+            prompt_messages = state['initial_messages'] + [
                  HumanMessage(content=f"# Previous Proposed Action\nAction: `{proposed_action.action}`\nReasoning: {proposed_action.reasoning}"),
                  HumanMessage(content=f"# Critique Received\nCritique: {critique.critique}\nMissing: {critique.missing}\nSuperfluous: {critique.superfluous}"),
-                 HumanMessage(content=f"# Task: Revise Action\n\nBased *specifically* on the critique provided, revise your proposed action and reasoning. Address the points raised. Use the {ProposedAction.__name__} tool.")
+                 HumanMessage(content=f"# Task: Revise Action\n\nBased *specifically* on the critique provided, revise your proposed action and reasoning. Use the {ProposedAction.__name__} tool.")
             ]
-            response = revise_llm.invoke(revision_prompt_messages)
-
+            response = revise_llm.invoke(prompt_messages)
+            
             if not response.tool_calls or response.tool_calls[0]['name'] != ProposedAction.__name__:
                  logger.error(f"LLM did not return the expected {ProposedAction.__name__} tool call during revision.")
-                 # Handle error - return original proposal?
-                 return {"messages": [response]} # Keep proposed_action as is in state?
+                 # Return empty update? Or keep original proposal?
+                 return {"messages": [response]} # Let add_messages handle the error message
             
-            # Parse and store the *revised* proposed action
             parsed_revised_proposal: ProposedAction = PydanticToolsParser(tools=[ProposedAction]).invoke(response)[0]
             logger.info(f"Revised Action: {parsed_revised_proposal.action}, Reasoning: {parsed_revised_proposal.reasoning[:50]}...")
-            # Update state: add AI response, update proposed_action, increment revision attempts
+            # Return updates: new message, revised proposal, incremented attempts
             return {
                 "messages": [response], 
                 "proposed_action": parsed_revised_proposal, 
@@ -538,7 +486,6 @@ Your goal is to decide the single best next action to take through proposal and 
             }
         except Exception as e:
             logger.error(f"Error in revise_action_node: {e}")
-            # Handle error state - potentially just keep the original proposal
             return {}
 
     # --- Conditional Edge Logic --- 
@@ -557,32 +504,26 @@ Your goal is to decide the single best next action to take through proposal and 
     def get_action(self, obs: dict) -> tuple[str, dict]:
         # 1. Preprocess observation (if needed, but harness usually does it)
         processed_obs = obs
-
-        # 2. Construct INITIAL prompt messages (for proposal step)
-        # NOTE: We are now creating the *initial* prompt here.
-        # The nodes themselves will add their specific task instructions later.
-        # This prompt needs access to the observation details.
+        # 2. Construct base messages for the graph
         initial_messages = self._construct_base_messages_for_graph(processed_obs)
 
-        # 3. Invoke the LangGraph graph with initial state
+        # 3. Invoke the Graph with Supervisor
         graph_input = {
-             "messages": initial_messages,
-             "proposed_action": None, # Explicitly start with no proposal
-             "critique": None,        # Explicitly start with no critique
+             "initial_messages": initial_messages, # Pass base messages
+             "messages": [], # Start with empty running messages for this cycle
+             "proposed_action": None, 
+             "critique": None,       
+             "supervisor_decision": None, # Start with no decision
              "revision_attempts": 0 
         }
         logger.info("Invoking Supervisor graph...")
         final_state = self.graph.invoke(graph_input)
         logger.info("Supervisor graph finished.")
-
-        # 4. Parse the FINAL action and critique from the final state
         final_supervisor_decision = final_state.get("supervisor_decision")
-        final_proposed_action = final_state.get("proposed_action")
-        final_critique = final_state.get("critique")
-
+        final_proposed_action = final_state.get("proposed_action") 
+        final_critique = final_state.get("critique") 
         action_str = "report_infeasible(\"Error: Could not determine final action after supervisor review.\")"
-        stored_critique = final_critique # Store the last critique generated
-
+        stored_critique = final_critique 
         if final_supervisor_decision:
              if final_supervisor_decision.next_step == "force_infeasible":
                   action_str = f"report_infeasible(\"Supervisor forced stop: {final_supervisor_decision.reasoning}\")"
@@ -590,37 +531,30 @@ Your goal is to decide the single best next action to take through proposal and 
              elif final_supervisor_decision.next_step == "final_answer" and final_proposed_action:
                   action_str = final_proposed_action.action
                   logger.info(f"Final Action Chosen (approved by supervisor): {action_str}")
-             elif final_proposed_action: # Fallback if supervisor ended unexpectedly but proposal exists
+             elif final_proposed_action:
                   logger.warning("Supervisor ended unexpectedly, using last proposed action.")
                   action_str = final_proposed_action.action
-             # Else: keep the default infeasible action
-        elif final_proposed_action: # Fallback if supervisor node failed entirely
+        elif final_proposed_action:
              logger.error("Supervisor decision missing, using last proposed action as fallback.")
              action_str = final_proposed_action.action
         else:
              logger.error("Supervisor decision and final proposal missing.")
-
-        # Ensure stored_critique is a Critique object, provide default if None
         if not isinstance(stored_critique, Critique):
             stored_critique = Critique(critique="No valid critique generated or graph failed.", is_sufficient=False, missing="N/A", superfluous="N/A")
-        
-        # 5. Store action and *final critique* history
         self.action_history.append(action_str)
         self.reflection_history.append(stored_critique)
-
-        # 6. Log step via AgentLogger (if enabled)
         if hasattr(self, 'agent_logger') and self.agent_logger is not None:
              try:
                  inputs = {
-                    "prompt_summary": "Supervisor Graph Invoked", # Updated summary
-                    "observation": {
-                        "num_chat_messages": len(processed_obs.get("chat_messages", [])),
-                        "has_screenshot": "screenshot" in processed_obs and processed_obs["screenshot"] is not None,
-                        "has_axtree": "axtree_txt" in processed_obs and processed_obs["axtree_txt"] is not None,
-                        "has_html": "pruned_html" in processed_obs and processed_obs["pruned_html"] is not None,
-                        "goal": str(processed_obs.get("goal_object", ""))[:100] + "..." if processed_obs.get("goal_object") and len(str(processed_obs["goal_object"])) > 100 else str(processed_obs.get("goal_object", "")),
-                        "last_action": processed_obs.get("last_action", ""),
-                        "last_action_error": processed_obs.get("last_action_error", ""),
+                    "prompt_summary": "Supervisor Graph Invoked", 
+                    "observation": { 
+                         "num_chat_messages": len(processed_obs.get("chat_messages", [])),
+                         "has_screenshot": "screenshot" in processed_obs and processed_obs["screenshot"] is not None,
+                         "has_axtree": "axtree_txt" in processed_obs and processed_obs["axtree_txt"] is not None,
+                         "has_html": "pruned_html" in processed_obs and processed_obs["pruned_html"] is not None,
+                         "goal": str(processed_obs.get("goal_object", ""))[:100] + "..." if processed_obs.get("goal_object") and len(str(processed_obs["goal_object"])) > 100 else str(processed_obs.get("goal_object", "")),
+                         "last_action": processed_obs.get("last_action", ""),
+                         "last_action_error": processed_obs.get("last_action_error", ""),
                     }
                  }
                  outputs = {
@@ -632,19 +566,14 @@ Your goal is to decide the single best next action to take through proposal and 
                      "critique_text": stored_critique.critique,
                      "supervisor_decision": final_supervisor_decision.next_step if final_supervisor_decision else "N/A"
                  }
-                 # self.agent_logger.log_step(inputs, outputs) # Uncomment if AgentLogger is available
-
                  action_type = action_str.split("(")[0] if "(" in action_str else "unknown"
                  action_args = action_str.split("(", 1)[1].rstrip(")") if "(" in action_str else ""
                  step_count = len(self.action_history)
-                 # Update print log to show supervisor decision if available
                  supervisor_info = f" | Supervisor: {final_supervisor_decision.next_step}" if final_supervisor_decision else ""
                  print(f"Step {step_count}: {action_type} {action_args[:30]}{'...' if len(action_args) > 30 else ''}{supervisor_info}")
              except Exception as e:
                  logger.error(f"Failed to log step: {e}")
-
-        # 7. Return the action string
-        return action_str, {} # Return empty dict as second element
+        return action_str, {}
 
     def _construct_base_messages_for_graph(self, processed_obs: dict) -> List[BaseMessage]:
         """Helper to construct the common part of messages list for graph nodes."""
