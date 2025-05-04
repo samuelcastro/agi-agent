@@ -36,6 +36,9 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # from rl_training.agents.agent_logger_class import AgentLogger
 
+# Import the new multi-agent components
+from agents import OrchestratorAgentArgs
+
 # Configure logging with more detailed output
 logging.basicConfig(
     level=logging.INFO,
@@ -340,48 +343,73 @@ class DemoAgent(Agent):
 
         # append past actions (and last error message) if any
         if self.action_history:
+            # Add header for history section
             user_msgs.append(
                 {
                     "type": "text",
-                    "text": f"""\
-                            # History of past actions
-                            """,
+                    "text": "# History of past actions\n",
                 }
             )
+            # Add each past action as a separate message
             user_msgs.extend(
                 [
                     {
                         "type": "text",
-                        "text": f"""\
-                                {action}
-                                """,
+                        "text": f"{action}", # Each action on its own line/message
                     }
                     for action in self.action_history
                 ]
             )
 
+            # Add error critique or history reflection message
             if obs["last_action_error"]:
-                user_msgs.append(
-                    {
-                        "type": "text",
-                        "text": f"""\
-                            # Error message from last action
+                critique_prompt = f"""# Error message from last action
 
-                            {obs["last_action_error"]}
+{obs["last_action_error"]}
 
-                            """,
-                    }
-                )
+# Self-Critique and Correction
+
+Analyze the error message above. Explain why the last action failed and how your next action will address this error to achieve the goal.
+"""
+                user_msgs.append({"type": "text", "text": critique_prompt})
+            else:
+                # Add a reflection prompt if there was no error
+                reflection_prompt = f"""# Reflection on History
+
+Briefly explain how the history of actions informs your next step towards the goal.
+"""
+                user_msgs.append({"type": "text", "text": reflection_prompt})
+
+        # Add reflection step (This is the separate overall reflection)
+        user_msgs.append(
+            {
+                "type": "text",
+                "text": f"""# Reflection & Planning
+
+Review your progress towards the goal: '{obs["goal_object"]}'.
+Assess the effectiveness of your previous actions based on the history and current page state.
+Briefly state your current high-level plan. **Then, outline the next 1-3 specific steps you *think* you will take. This plan is for your reasoning only.**
+
+Example Plan Outline (for reasoning only):
+1. Fill the 'username' field (bid=25) with 'testuser'.
+2. Fill the 'password' field (bid=28) with 'password123'.
+3. Click the 'Login' button (bid=30).
+"""
+            }
+        )
 
         # ask for the next action
         user_msgs.append(
             {
                 "type": "text",
-                "text": f"""\
-                            # Next action
+                "text": f"""\n# Next action
 
-                            You will now think step by step and produce your next best action. Reflect on your past actions, any resulting error message, the current state of the page before deciding on your next action.
-                            """,
+Based on your reflection and plan, think step by step and produce **only the single, immediate next action** required to progress towards the goal. 
+Your final answer MUST be ONLY the action call, enclosed in markdown code fences.
+
+Example final output:
+```click("12")```
+"""
             }
         )
 
@@ -477,17 +505,21 @@ class DemoAgentArgs(AbstractAgentArgs):
         )
 
 
-# Example creating and using the DemoAgent
+# Example creating and using the DemoAgent (Now OrchestratorAgent)
 def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_id=None, task_name="webclones.omnizon-1"):    
     # Create the agent arguments with the specified parameters
-    agent_args = DemoAgentArgs(
-        model_name=model_name,
-        chat_mode=False,
-        demo_mode="off",
-        use_html=False,
-        use_axtree=True,
-        use_screenshot=True,
-        system_message_handling="separate"
+    # agent_args = DemoAgentArgs(
+    #     model_name=model_name,
+    #     chat_mode=False,
+    #     demo_mode="off",
+    #     use_html=False,
+    #     use_axtree=True,
+    #     use_screenshot=True,
+    #     system_message_handling="separate"
+    # )
+    
+    agent_args = OrchestratorAgentArgs(
+        model_name=model_name
     )
     
     # Pass the agent arguments to the harness through the agisdk module
@@ -499,10 +531,14 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
         task_type="omnizon",
         headless=True,          # Configurable browser visibility
         max_steps=25,               # Maximum steps per task
-        use_axtree=agent_args.use_axtree,         # Pass through from agent args
-        use_screenshot=agent_args.use_screenshot,  # Pass through from agent args
+        # Ensure these match how obs data is used in Planner/Actor
+        # Pass relevant args from agent_args if needed
+        use_axtree=True,         # Example: Assuming AXTree is needed
+        use_screenshot=False,  # Example: Assuming Screenshot is not needed by default
+        # use_html=False,
         leaderboard=leaderboard,    # Whether to submit to leaderboard
         run_id=run_id,              # Run ID for leaderboard submission
+        use_cache=False
     )
     
     # Run the task
@@ -518,4 +554,6 @@ def run_demo_agent(model_name="gpt-4o", headless=False, leaderboard=False, run_i
 
 if __name__ == "__main__":
     # Run the agent with the specified parameters
+    # Make sure the agent logger logic (if used) is compatible or removed/updated
+    # Currently, AgentLogger is commented out in DemoAgent and not added to OrchestratorAgent
     results = run_demo_agent()
