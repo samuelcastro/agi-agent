@@ -37,7 +37,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # from rl_training.agents.agent_logger_class import AgentLogger
 
 # Import the new multi-agent components
-from multi_agent import OrchestratorAgentArgs
+from agents import OrchestratorAgentArgs
 
 # Configure logging with more detailed output
 logging.basicConfig(
