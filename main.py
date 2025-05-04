@@ -199,6 +199,14 @@ class DemoAgent(Agent):
 
         # Compile the graph
         self.graph = builder.compile()
+        # --- Visualize Graph (Optional) ---
+        try:
+            print("--- LangGraph Mermaid Diagram ---")
+            print(self.graph.get_graph().draw_mermaid())
+            print("---------------------------------")
+        except Exception as e:
+            logger.warning(f"Could not generate graph diagram: {e}. Optional dependencies might be missing.")
+        # ----------------------------------
         # print(self.graph.get_graph().print_ascii()) # Optional: print graph structure
         # --- End LangGraph Setup ---
 
